@@ -1,63 +1,76 @@
 import asyncio
-from dataclasses import dataclass
 import logging
 import sys
-from typing import override
+from typing import cast, override
 
 from aio_pika import Message, connect_robust
-from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractExchange, AbstractIncomingMessage, AbstractMessage, AbstractQueue, AbstractRobustConnection, ExchangeType
-from bourgade import Event, EventBus, EventHandler
+from aio_pika.abc import (
+        AbstractChannel, 
+        AbstractConnection, 
+        AbstractExchange, 
+        AbstractIncomingMessage, 
+        AbstractMessage, 
+        AbstractQueue, 
+        ExchangeType,
+)
+from bourgade import Event, EventBus, EventBusSetupOptions, EventHandler
 
 logger = logging.getLogger("Bourgade over RabbitMQ")
 
 
-@dataclass
-class RabbitMQEventBus(EventBus):
+class RabbitMQEventBusSetupOptions(EventBusSetupOptions):
+    host: str
+    username: str
+    password: str
+    exchange_name: str
+    queue_name: str
+    connection_delay: int
+    connection_retries: int
+    connection_retry_interval: int
+
+
+class RabbitMQEventBus(EventBus[RabbitMQEventBusSetupOptions]):
     connection: AbstractConnection
     channel: AbstractChannel
     exchange: AbstractExchange
     queue: AbstractQueue
 
     @override
-    @classmethod
-    async def create(cls, host: str, username: str, password: str, exchange_name: str, queue_name: str, *, connection_delay: int = 0, connection_retries: int = 10, connection_retry_interval: int = 3) -> "EventBus":
-        await asyncio.sleep(connection_delay)
-        while (connection_retries := connection_retries - 1) > 0:
+    async def setup(self, options: RabbitMQEventBusSetupOptions) -> None:
+        await asyncio.sleep(options['connection_delay'])
+        connection_retries_left: int = options['connection_retries']
+        while connection_retries_left > 0:
             try:
-                connection: AbstractRobustConnection = await connect_robust(
-                    host=host, login=username, password=password
+                self.connection = await connect_robust(
+                    host=options['host'],
+                    login=options['username'],
+                    password=options['password'],
                 )
-                channel: AbstractChannel = await connection.channel()
-                _ = await channel.set_qos(prefetch_count=1)
-                exchange: AbstractExchange = await channel.declare_exchange(
-                    name=exchange_name,
+                self.channel = await self.connection.channel()
+                _ = await self.channel.set_qos(prefetch_count=1)
+                self.exchange = await self.channel.declare_exchange(
+                    name=options['exchange_name'],
                     type=ExchangeType.TOPIC,
                     passive=False,
                     durable=True,
                     auto_delete=False,
                 )
 
-                queue: AbstractQueue = await channel.declare_queue(
-                    name=queue_name, auto_delete=True
+                self.queue = await self.channel.declare_queue(
+                    name=options['queue_name'],
+                    auto_delete=True
                 )
 
-                return RabbitMQEventBus(
-                    event_handlers={},
-                    all_catch_event_handler=None,
-                    connection=connection,
-                    channel=channel,
-                    exchange=exchange,
-                    queue=queue,
-                )
             except Exception:
-                await asyncio.sleep(connection_retry_interval)
+                await asyncio.sleep(options['connection_retry_interval'])
+                connection_retries_left -= 1
 
         raise ValueError(
             "Bourgade connection to RMQ failed after several retries."
         ) from sys.last_exc
 
     @override
-    async def start_listening(self) -> None:
+    async def listen(self) -> None:
         if self.all_catch_event_handler is None:
             for event_handler in self.event_handlers.values():
                 event_name: str = event_handler.get_event_type().get_event_name()
@@ -131,7 +144,7 @@ class RabbitMQEventBus(EventBus):
         try:
             if routing_key in self.event_handlers:
                 event_handler: EventHandler[Event] = self.event_handlers[routing_key]
-                await event_handler.trigger(event_bus=self, message=message)
+                await event_handler.trigger(event_bus=cast(EventBus[EventBusSetupOptions], self), message=message)
             elif self.all_catch_event_handler is not None:
                 self.all_catch_event_handler(
                     event_name=routing_key, message_bytes=message

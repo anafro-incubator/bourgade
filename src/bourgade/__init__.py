@@ -1,16 +1,13 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 import json
 from time import time
-from typing import Any, Protocol, cast
+from typing import Protocol, TypedDict, cast
 
-from aio_pika.abc import (
-    AbstractIncomingMessage,
-)
 from reification import Reified
 
 from bourgade.utils.dicts import optional_entry
 
+type JsonDict = dict[str, object]
 
 class AllCatchEventHandler(Protocol):
     def __call__(self, event_name: str, message_bytes: bytes) -> None: ...
@@ -35,7 +32,7 @@ class EventHandler[E: Event = Event](ABC, Reified):
         """
         return cast(type[E], cls.targ)
 
-    async def trigger(self, event_bus: "EventBus", message: bytes) -> None:
+    async def trigger(self, event_bus: "EventBus[EventBusSetupOptions]", message: bytes) -> None:
         """
         Builds, and hydrates a new event object from RabbitMQ deliver,
         and triggers `handle` within this handler.
@@ -61,8 +58,11 @@ class EventHandler[E: Event = Event](ABC, Reified):
         ...
 
 
-@dataclass
-class EventBus(ABC):
+class EventBusSetupOptions(TypedDict):
+    pass
+
+
+class EventBus[TSetupOptions: EventBusSetupOptions](ABC):
     """
     Connects to RabbitMQ, declares its abstractions,
     and manages RabbitMQ messages, passing them to handlers.
@@ -71,29 +71,10 @@ class EventBus(ABC):
     all_catch_event_handler: AllCatchEventHandler | None
     event_handlers: dict[str, EventHandler["Event"]]
 
-    @abstractmethod
-    @classmethod
-    async def create(
-        cls,
-        host: str,
-        username: str,
-        password: str,
-        exchange_name: str,
-        queue_name: str,
-        *,
-        connection_delay: int = 0,
-        connection_retries: int = 10,
-        connection_retry_interval: int = 3,
-    ) -> "EventBus":
-        """
-        Creates a new event bus.
-
-        :param str host: The RabbitMQ host
-        :param str username: The RabbitMQ username
-        :param str password: The RabbitMQ password
-        :param str exchange_name: The RabbitMQ exchange name containing events across the infrastructure
-        :param str host: The RabbitMQ queue name consuming events within the app
-        """
+    def __init__(self) -> None:
+        self.all_catch_event_handler = None
+        self.event_handlers = {}
+    
 
     def register_handler[E: Event](self, event_handler: EventHandler[E]) -> None:
         """
@@ -114,20 +95,31 @@ class EventBus(ABC):
         self.all_catch_event_handler = all_catch_event_handler
 
     @abstractmethod
-    async def start_listening(self) -> None:
+    async def setup(self, options: TSetupOptions) -> None:
         """
-        Starts listening for RabbitMQ messages.
+        Used for setting up the bus. It is called automatically
+        when creating the bus via Bourgade 'bus' helper.
+        Here, the bus can create message exchange provider-specific clients,
+        establish non-blocking connections, and etc.
+
+        Notice that the listening/subscriber loop should not be here.
+        Instead, implement it in `listen()` abstract method.
+        """
+
+    @abstractmethod
+    async def listen(self) -> None:
+        """
+        Starts listening for messages.
         This method is blocking.
         """
 
     @abstractmethod
     async def dispatch(self, event: "Event") -> None:
         """
-        Dispatches an event to RabbitMQ exchange.
+        Dispatches an event to exchange.
 
         :param Event event: The event to dispatch
         """
-
 
 
 class Event(ABC):
@@ -136,26 +128,26 @@ class Event(ABC):
     So to use Bourgade events, you must implement get/set contents of the object.
     """
 
-    event_bus: EventBus
+    event_bus: EventBus[EventBusSetupOptions]
     happened_at: int
     sid: str | None
 
-    def __init__(self, event_bus: EventBus, happened_at: int) -> None:
+    def __init__(self, event_bus: EventBus[EventBusSetupOptions], happened_at: int) -> None:
         self.event_bus = event_bus
         self.happened_at = happened_at
         self.sid = None
 
     @abstractmethod
-    def get_content_as_dict(self) -> dict[str, Any]: ...
+    def get_content_as_dict(self) -> JsonDict: ...
 
     @abstractmethod
-    def set_content_from_dict(self, content: dict[str, Any]) -> None: ...
+    def set_content_from_dict(self, content: JsonDict) -> None: ...
 
     def hydrate(self, message: bytes) -> None:
-        payload: dict[str, Any] = json.loads(message)
-        header: dict[str, Any] = payload["header"]
-        content: dict[str, Any] = payload["content"]
-        self.sid = header.get("sid")
+        payload: JsonDict = cast(JsonDict, json.loads(message))
+        header: JsonDict = cast(JsonDict, payload["header"])
+        content: JsonDict = cast(JsonDict, payload["content"])
+        self.sid = cast(str, header.get("sid"))
         self.set_content_from_dict(content=content)
 
     def serialize(self) -> bytes:
@@ -182,7 +174,7 @@ class Event(ABC):
         ...
 
     @classmethod
-    def create(cls, event_bus: EventBus, content: dict[str, Any]) -> "Event":
+    def create(cls, event_bus: EventBus[EventBusSetupOptions], content: JsonDict) -> "Event":
         happened_at: int = int(time() * 1000)
         event = cls(event_bus=event_bus, happened_at=happened_at)
         event.set_content_from_dict(content=content)
