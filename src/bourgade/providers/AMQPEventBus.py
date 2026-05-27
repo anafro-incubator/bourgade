@@ -13,7 +13,7 @@ from aio_pika.abc import (
         AbstractQueue, 
         ExchangeType,
 )
-from bourgade import Event, EventBus, EventBusSetupOptions, EventHandler
+from bourgade import Event, EventBus, EventBusSetupOptions
 
 logger = logging.getLogger("Bourgade over RabbitMQ")
 
@@ -142,15 +142,7 @@ class RabbitMQEventBus(EventBus[RabbitMQEventBusSetupOptions]):
         logger.info("[RECV] %s", routing_key)
 
         try:
-            if routing_key in self.event_handlers:
-                event_handler: EventHandler[Event] = self.event_handlers[routing_key]
-                await event_handler.trigger(event_bus=cast(EventBus[EventBusSetupOptions], self), message=message)
-            elif self.all_catch_event_handler is not None:
-                self.all_catch_event_handler(
-                    event_name=routing_key, message_bytes=message
-                )
-            else:
-                raise ValueError(f"There is no event handler for '{routing_key}'.")
+            self.trigger(message)
         except Exception as exception:
             logger.error(
                 msg="Event is NACK because of an exception.", exc_info=exception

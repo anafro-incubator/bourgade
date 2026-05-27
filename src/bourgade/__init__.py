@@ -41,10 +41,7 @@ class EventHandler[E: Event = Event](ABC, Reified):
         :param Basic.Deliver deliver: The RabbitMQ deliver object considered to be an event for the handler
         :param bytes message: The RabbitMQ message bytes for event hydration
         """
-        ThisEvent: type[E] = self.get_event_type()
-        happened_at: int = int(time() * 1000)
-        event = ThisEvent(event_bus=event_bus, happened_at=happened_at)
-        event.hydrate(message=message)
+        event: E = cast(E, event_bus.deserialize_event(message))
         await self.handle(event=event)
 
     @abstractmethod
@@ -74,7 +71,26 @@ class EventBus[TSetupOptions: EventBusSetupOptions](ABC):
     def __init__(self) -> None:
         self.all_catch_event_handler = None
         self.event_handlers = {}
-    
+
+    def deserialize_event(self, message_bytes: bytes) -> Event:
+        event_name = Event.get_event_name_from_bytes(message_bytes)
+        ThisEvent: type[Event] = self.event_handlers[event_name].get_event_type()
+        happened_at: int = int(time() * 1000)
+        event = ThisEvent(event_bus=cast(EventBus[EventBusSetupOptions], self), happened_at=happened_at)
+        event.hydrate(message=message_bytes)
+
+        return event
+
+    async def trigger(self, message_bytes: bytes) -> None:
+        event_name: str = Event.get_event_name_from_bytes(message_bytes)
+
+        if event_name in self.event_handlers:
+            event_handler: EventHandler[Event] = self.event_handlers[event_name]
+            await event_handler.trigger(event_bus=cast(EventBus[EventBusSetupOptions], self), message=message_bytes)
+        elif self.all_catch_event_handler is not None:
+            self.all_catch_event_handler(event_name, message_bytes)
+        else:
+            raise ValueError(f"There is no event handler for '{event_name}'.")
 
     def register_handler[E: Event](self, event_handler: EventHandler[E]) -> None:
         """
@@ -136,6 +152,13 @@ class Event(ABC):
         self.event_bus = event_bus
         self.happened_at = happened_at
         self.sid = None
+
+    @staticmethod
+    def get_event_name_from_bytes(message_bytes: bytes) -> str:
+        message: str = message_bytes.decode()
+        payload: JsonDict = cast(JsonDict, json.loads(message))
+        header: JsonDict = cast(JsonDict, payload["header"])
+        return cast(str, header.get("event"))
 
     @abstractmethod
     def get_content_as_dict(self) -> JsonDict: ...
